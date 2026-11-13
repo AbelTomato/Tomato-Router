@@ -1,0 +1,102 @@
+# Tomato Router example configuration.
+#
+# Copy this file to config/tomato.toml and replace the placeholder URLs and
+# environment variable names. The real config file is gitignored.
+
+[server]
+# Loopback is the safe default. Use "0.0.0.0:8787" only when WSL or another
+# machine must connect, and enable local authentication in that case.
+listen = "127.0.0.1:8787"
+
+# Recommended for any non-loopback listener. Codex sends the key as
+# `Authorization: Bearer <key>`.
+require_auth = false
+# require_auth = true
+# api_keys = ["${TOMATO_ROUTER_KEY}"]
+
+max_body_bytes = 33554432
+connect_timeout_ms = 10000
+first_byte_timeout_ms = 120000
+stream_idle_timeout_ms = 300000
+# Logs full request bodies at info level. Keep this off unless debugging:
+# request bodies contain prompts, source code and tool output.
+log_request_bodies = false
+
+# ---------------------------------------------------------------------------
+# Provider 1: native OpenAI Responses API.
+# ---------------------------------------------------------------------------
+[[providers]]
+id = "primary"
+name = "Primary relay (native Responses)"
+base_url = "https://relay-primary.example.com/v1"
+wire_api = "responses"
+
+# Prefer api_key_env (or api_key = "${PRIMARY_API_KEY}").
+api_key_env = "PRIMARY_API_KEY"
+# api_key = "sk-..."
+# auth = { type = "none" }            # for a local provider without auth
+# auth = { type = "header", header = "x-api-key", prefix = "" }
+# auth = { type = "query", query_param = "api_key" }
+
+# Optional static headers/query parameters added to every upstream request.
+# [providers.headers]
+# "X-Custom-Header" = "value"
+# [providers.query]
+# region = "us"
+
+max_concurrency = 4
+# max_queue = 0 means: if all concurrency slots are busy, fail over immediately.
+max_queue = 8
+queue_timeout_ms = 800
+cooldown_ms = 30000
+failure_threshold = 3
+
+# Client-facing model name -> upstream model name.
+[providers.models]
+"gpt-5.5" = "gpt-5.5"
+"gpt-5.6-terra" = "gpt-5.6-terra"
+
+# ---------------------------------------------------------------------------
+# Provider 2: Chat Completions-only relay, adapted by the gateway.
+#
+# The Chat adapter currently supports streaming requests only. It flattens
+# namespaces, turns custom tools (including apply_patch) into functions with a
+# single `input` string, and reconstructs Responses SSE events on the way back.
+# ---------------------------------------------------------------------------
+[[providers]]
+id = "backup"
+name = "Backup relay (Chat adapter)"
+base_url = "https://relay-backup.example.com/v1"
+wire_api = "chat"
+api_key_env = "BACKUP_API_KEY"
+
+max_concurrency = 2
+max_queue = 0
+queue_timeout_ms = 500
+cooldown_ms = 30000
+failure_threshold = 3
+
+[providers.models]
+"gpt-5.5" = "gpt-5.5"
+"gpt-5.6-terra" = "gpt-5.6-terra"
+
+[providers.compat]
+# Most relays accept `max_tokens`; some newer APIs require `max_completion_tokens`.
+max_tokens_field = "max_tokens"
+# Disable these for relays that reject the corresponding fields.
+supports_stream_options = false
+supports_reasoning_effort = false
+supports_parallel_tool_calls = false
+# reasoning_field = "reasoning_content"
+# extra_body = { top_k = 20 }
+
+# ---------------------------------------------------------------------------
+# Routes
+#
+# Exact model routes win. A "*" route is the fallback for every other model.
+# If no route matches and there is no "*" route, provider declaration order is
+# the strict priority order.
+# ---------------------------------------------------------------------------
+[[routes]]
+model = "*"
+chain = ["primary", "backup"]

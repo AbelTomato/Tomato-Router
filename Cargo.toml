@@ -1,0 +1,27 @@
+[package]
+name = "tomato-router"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arc-swap = "1.9.5"
+async-stream = "0.3.6"
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures-util = "0.3.34"
+http = "1.5.0"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+toml = "1.2.1"
+tower-http = { version = "0.7.1", features = ["trace", "limit"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+uuid = { version = "1.29.2", features = ["v4"] }
