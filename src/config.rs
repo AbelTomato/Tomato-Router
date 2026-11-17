@@ -3,10 +3,10 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -16,7 +16,7 @@ pub struct Config {
     pub routes: Vec<RouteConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -51,7 +51,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
     #[serde(default)]
@@ -132,7 +132,7 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WireApi {
     #[default]
@@ -149,7 +149,7 @@ impl fmt::Display for WireApi {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(rename = "type", default)]
     pub kind: AuthKind,
@@ -161,7 +161,7 @@ pub struct AuthConfig {
     pub query_param: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthKind {
     #[default]
@@ -171,7 +171,7 @@ pub enum AuthKind {
     None,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct CompatConfig {
     /// `max_tokens` is the widest-compatibility default for relay services.
     #[serde(default = "default_max_tokens_field")]
@@ -203,24 +203,39 @@ impl Default for CompatConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub model: String,
     pub chain: Vec<String>,
 }
 
 impl Config {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+    /// Read and parse a configuration file without running semantic validation.
+    ///
+    /// The TUI uses this so a configuration with missing environment variables
+    /// can still be opened and repaired interactively.
+    pub fn parse(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config `{}`", path.display()))?;
-        let config: Self = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config `{}`", path.display()))?;
+        toml::from_str(&raw).with_context(|| format!("failed to parse config `{}`", path.display()))
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let config = Self::parse(path)?;
         config.validate()?;
         Ok(config)
     }
 
+    /// Full validation used by the CLI and by service startup.
     pub fn validate(&self) -> Result<()> {
+        self.validate_structure()?;
+        self.validate_runtime()
+    }
+
+    /// Validate shape, references and numeric limits without touching the
+    /// process environment.
+    pub fn validate_structure(&self) -> Result<()> {
         if self.providers.is_empty() {
             bail!("config must define at least one provider");
         }
@@ -258,9 +273,6 @@ impl Config {
                     provider.id
                 );
             }
-            if provider.has_auth() {
-                provider.resolve_api_key().map_err(anyhow::Error::msg)?;
-            }
             if let Some(extra) = &provider.compat.extra_body
                 && !extra.is_object()
             {
@@ -271,6 +283,9 @@ impl Config {
             }
         }
 
+        if self.server.listen.trim().is_empty() {
+            bail!("server.listen must not be empty");
+        }
         if self.server.max_body_bytes == 0 {
             bail!("server.max_body_bytes must be > 0");
         }
@@ -315,6 +330,18 @@ impl Config {
         Ok(())
     }
 
+    /// Validate that configured secrets can be resolved. This reads the process
+    /// environment and is therefore separate from structural validation.
+    pub fn validate_runtime(&self) -> Result<()> {
+        for (id, ok, detail) in self.provider_env_status() {
+            if !ok {
+                bail!("provider `{id}`: {detail}");
+            }
+        }
+        self.resolved_server_api_keys()?;
+        Ok(())
+    }
+
     pub fn resolved_server_api_keys(&self) -> Result<Vec<String>> {
         self.server
             .api_keys
@@ -330,8 +357,19 @@ impl Config {
                 if !provider.has_auth() {
                     return (provider.id.clone(), true, "auth disabled".to_string());
                 }
-                if provider.api_key.is_some() {
-                    return (provider.id.clone(), true, "inline api_key".to_string());
+                if let Some(value) = &provider.api_key {
+                    return match expand_env(value) {
+                        Ok(_) => (
+                            provider.id.clone(),
+                            true,
+                            if value.contains("${") {
+                                "inline environment reference".to_string()
+                            } else {
+                                "inline api_key".to_string()
+                            },
+                        ),
+                        Err(error) => (provider.id.clone(), false, error),
+                    };
                 }
                 match &provider.api_key_env {
                     Some(name) => {
@@ -357,6 +395,62 @@ impl Config {
             })
             .collect()
     }
+
+    /// Human-readable summary shared by `--check` and the TUI.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "config OK: {} provider(s), {} route(s), listen={}",
+            self.providers.len(),
+            self.routes.len(),
+            self.server.listen
+        )];
+        lines.push(format!(
+            "local auth: {}",
+            if self.server.require_auth {
+                format!("required ({} key(s))", self.server.api_keys.len())
+            } else {
+                "disabled".to_string()
+            }
+        ));
+        for (id, ok, detail) in self.provider_env_status() {
+            lines.push(format!(
+                "provider {id}: auth={} ({detail})",
+                if ok { "ok" } else { "MISSING" }
+            ));
+        }
+        for route in &self.routes {
+            lines.push(format!(
+                "route {} -> {}",
+                route.model,
+                route.chain.join(" -> ")
+            ));
+        }
+        if self.routes.is_empty() {
+            let order = self
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            lines.push(format!("default chain (declaration order): {order}"));
+        }
+        lines
+    }
+
+    /// Serialize the complete configuration. Comments and unknown fields from
+    /// the original document are not preserved by this writer.
+    pub fn to_toml_pretty(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("failed to serialize config")
+    }
+}
+
+/// True when `listen` binds a loopback address (or a loopback hostname).
+pub fn is_loopback_listen(listen: &str) -> bool {
+    let host = listen
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .unwrap_or(listen);
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 fn expand_env(value: &str) -> Result<String, String> {
@@ -463,5 +557,63 @@ mod tests {
         )
         .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn structural_validation_does_not_resolve_secrets() {
+        let config: Config = toml::from_str(
+            r#"
+            [[providers]]
+            id = "relay"
+            base_url = "https://relay.example/v1"
+            api_key = "${TOMATO_TEST_MISSING_KEY_9B3F}"
+            "#,
+        )
+        .unwrap();
+        config.validate_structure().unwrap();
+        assert!(config.validate_runtime().is_err());
+        let status = config.provider_env_status();
+        assert!(!status[0].1);
+    }
+
+    #[test]
+    fn serialized_config_round_trips() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            listen = "0.0.0.0:8787"
+            require_auth = true
+            api_keys = ["${TOMATO_ROUTER_KEY}"]
+            log_request_bodies = true
+
+            [[providers]]
+            id = "primary"
+            name = "Primary"
+            base_url = "https://relay.example/v1"
+            wire_api = "responses"
+            api_key_env = "PRIMARY_KEY"
+            max_concurrency = 2
+            max_queue = 3
+            headers = { "X-Test" = "yes" }
+
+            [providers.models]
+            "client-model" = "upstream-model"
+
+            [providers.compat]
+            max_tokens_field = "max_completion_tokens"
+            supports_stream_options = false
+            extra_body = { top_k = 20 }
+
+            [[routes]]
+            model = "*"
+            chain = ["primary"]
+            "#,
+        )
+        .unwrap();
+        config.validate_structure().unwrap();
+
+        let text = config.to_toml_pretty().unwrap();
+        let round: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config, round);
     }
 }

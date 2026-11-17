@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use clap::Parser;
-use tomato_router::{Config, build_app, state::AppState};
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+use tomato_router::config::is_loopback_listen;
+use tomato_router::{Config, build_app, codex, server, state::AppState, tui};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -36,16 +37,122 @@ struct Cli {
     /// Emit JSON logs instead of human-readable logs.
     #[arg(long)]
     log_json: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Synchronize the local Tomato Router provider into Codex config.toml.
+    Codex(CodexCommand),
+
+    /// Open the interactive terminal console.
+    Tui(TuiArgs),
+}
+
+#[derive(Debug, Args)]
+struct TuiArgs {
+    /// Start the gateway immediately after the TUI opens.
+    #[arg(long)]
+    autostart: bool,
+}
+
+#[derive(Debug, Args)]
+struct CodexCommand {
+    #[command(subcommand)]
+    command: CodexSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexSubcommand {
+    /// Update Codex's user config while preserving unrelated settings.
+    Sync(CodexSyncArgs),
+}
+
+#[derive(Debug, Args)]
+struct CodexSyncArgs {
+    /// Explicit path to Codex config.toml (also supports a WSL UNC path).
+    #[arg(long)]
+    codex_config: Option<PathBuf>,
+
+    /// Codex home directory containing config.toml.
+    #[arg(long)]
+    codex_home: Option<PathBuf>,
+
+    /// Codex provider id to update.
+    #[arg(long, default_value = "tomato")]
+    provider: String,
+
+    /// Default Codex model. Defaults to the first routed or mapped model.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Client-facing gateway URL. Defaults to server.listen plus /v1.
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Show the planned update without writing or creating a backup.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Command::Tui(args)) = &cli.command {
+        return tui::run(tui::Options {
+            config_path: cli.config.clone(),
+            listen_override: cli.listen.clone(),
+            log_filter: cli.log.clone(),
+            autostart: args.autostart,
+        })
+        .await;
+    }
+
     init_tracing(cli.log.as_deref(), cli.log_json);
 
     let mut config = Config::load(&cli.config)?;
     if let Some(listen) = &cli.listen {
         config.server.listen = listen.clone();
+    }
+
+    if let Some(Command::Codex(CodexCommand {
+        command: CodexSubcommand::Sync(args),
+    })) = cli.command
+    {
+        let dry_run = args.dry_run;
+        let plan = codex::sync(
+            &config,
+            &codex::SyncOptions {
+                codex_config: args.codex_config,
+                codex_home: args.codex_home,
+                provider_id: args.provider,
+                model: args.model,
+                base_url: args.base_url,
+                dry_run,
+            },
+        )?;
+        println!(
+            "Codex config {}: {}",
+            if dry_run { "would update" } else { "updated" },
+            plan.path.display()
+        );
+        println!(
+            "provider={} model={} base_url={} wire_api=responses env_key={}",
+            plan.provider_id,
+            plan.model,
+            plan.base_url,
+            codex::DEFAULT_ENV_KEY
+        );
+        if let Some(backup) = plan.backup {
+            println!("backup={}", backup.display());
+        }
+        if !plan.changed {
+            println!("no changes needed");
+        }
+        return Ok(());
     }
 
     if cli.check {
@@ -65,12 +172,7 @@ async fn main() -> Result<()> {
     let state = AppState::new(config)?;
     let app = build_app(state);
 
-    let listener = tokio::net::TcpListener::bind(&listen)
-        .await
-        .with_context(|| format!("failed to bind {listen}"))?;
-    let actual = listener
-        .local_addr()
-        .with_context(|| "failed to read local address")?;
+    let (listener, actual) = server::bind(&listen).await?;
 
     tracing::info!(
         listen = %actual,
@@ -78,10 +180,7 @@ async fn main() -> Result<()> {
         "tomato-router listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed")?;
+    server::serve(listener, app, shutdown_signal()).await?;
 
     tracing::info!("tomato-router stopped");
     Ok(())
@@ -103,46 +202,9 @@ fn init_tracing(filter: Option<&str>, json: bool) {
 }
 
 fn print_config_summary(config: &Config) {
-    println!(
-        "config OK: {} provider(s), {} route(s), listen={}",
-        config.providers.len(),
-        config.routes.len(),
-        config.server.listen
-    );
-    println!(
-        "local auth: {}",
-        if config.server.require_auth {
-            format!("required ({} key(s))", config.server.api_keys.len())
-        } else {
-            "disabled".to_string()
-        }
-    );
-    for (id, ok, detail) in config.provider_env_status() {
-        println!(
-            "provider {id}: auth={} ({detail})",
-            if ok { "ok" } else { "MISSING" }
-        );
+    for line in config.summary_lines() {
+        println!("{line}");
     }
-    for route in &config.routes {
-        println!("route {} -> {}", route.model, route.chain.join(" -> "));
-    }
-    if config.routes.is_empty() {
-        let order = config
-            .providers
-            .iter()
-            .map(|provider| provider.id.as_str())
-            .collect::<Vec<_>>()
-            .join(" -> ");
-        println!("default chain (declaration order): {order}");
-    }
-}
-
-fn is_loopback_listen(listen: &str) -> bool {
-    let host = listen
-        .rsplit_once(':')
-        .map(|(host, _)| host.trim_matches(['[', ']']))
-        .unwrap_or(listen);
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 async fn shutdown_signal() {

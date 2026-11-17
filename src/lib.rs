@@ -5,14 +5,18 @@
 //! Chat Completions providers through the translation adapter
 //! (`wire_api = "chat"`).
 
+pub mod codex;
 pub mod config;
 pub mod error;
+pub mod fsutil;
 pub mod gateway;
+pub mod metrics;
 pub mod protocol;
 pub mod provider;
 pub mod router;
 pub mod server;
 pub mod state;
+pub mod tui;
 pub mod upstream;
 
 pub use config::Config;

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::{AuthKind, Config, ProviderConfig};
+use crate::config::{AuthKind, Config, ProviderConfig, WireApi};
 use crate::error::ErrorKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,39 @@ pub enum QueueError {
     Full,
     Timeout,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerStatus {
+    Closed,
+    HalfOpen,
+    Open,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderErrorSnapshot {
+    pub kind: &'static str,
+    pub age_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderSnapshot {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub wire_api: WireApi,
+    pub max_concurrency: usize,
+    pub max_queue: usize,
+    pub queue_timeout_ms: u64,
+    pub inflight: usize,
+    pub queue_depth: usize,
+    pub breaker: BreakerStatus,
+    pub cooldown_ms_remaining: Option<u64>,
+    pub consecutive_failures: u32,
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub last_error: Option<ProviderErrorSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +63,11 @@ struct BreakerInner {
     failures: u32,
 }
 
+struct LastError {
+    kind: &'static str,
+    at: Instant,
+}
+
 pub struct Provider {
     pub config: ProviderConfig,
     pub client: reqwest::Client,
@@ -37,6 +75,10 @@ pub struct Provider {
     semaphore: Arc<Semaphore>,
     waiting: AtomicUsize,
     breaker: Mutex<BreakerInner>,
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    last_error: Mutex<Option<LastError>>,
 }
 
 impl Provider {
@@ -65,6 +107,10 @@ impl Provider {
                 state: BreakerState::Closed,
                 failures: 0,
             }),
+            attempts: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            last_error: Mutex::new(None),
         })
     }
 
@@ -172,9 +218,13 @@ impl Provider {
     pub fn begin_attempt(&self) -> bool {
         let mut breaker = self.breaker.lock().expect("breaker mutex poisoned");
         match breaker.state {
-            BreakerState::Closed | BreakerState::HalfOpen => true,
+            BreakerState::Closed | BreakerState::HalfOpen => {
+                self.attempts.fetch_add(1, Ordering::Relaxed);
+                true
+            }
             BreakerState::Open { until } if Instant::now() >= until => {
                 breaker.state = BreakerState::HalfOpen;
+                self.attempts.fetch_add(1, Ordering::Relaxed);
                 true
             }
             BreakerState::Open { .. } => false,
@@ -182,12 +232,21 @@ impl Provider {
     }
 
     pub fn record_success(&self) {
+        self.successes.fetch_add(1, Ordering::Relaxed);
         let mut breaker = self.breaker.lock().expect("breaker mutex poisoned");
         breaker.state = BreakerState::Closed;
         breaker.failures = 0;
     }
 
     pub fn record_failure(&self, kind: ErrorKind) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut last_error = self.last_error.lock().expect("last error mutex poisoned");
+            *last_error = Some(LastError {
+                kind: kind.as_str(),
+                at: Instant::now(),
+            });
+        }
         if !kind.should_trip_breaker() {
             return;
         }
@@ -211,29 +270,72 @@ impl Provider {
         }
     }
 
-    pub fn status(&self) -> Value {
+    pub fn snapshot(&self) -> ProviderSnapshot {
         let breaker = self.breaker.lock().expect("breaker mutex poisoned");
-        let (state, cooldown_until) = match breaker.state {
-            BreakerState::Closed => ("closed", None),
-            BreakerState::HalfOpen => ("half_open", None),
+        let (status, cooldown_ms_remaining) = match breaker.state {
+            BreakerState::Closed => (BreakerStatus::Closed, None),
+            BreakerState::HalfOpen => (BreakerStatus::HalfOpen, None),
             BreakerState::Open { until } => {
                 let remaining = until.saturating_duration_since(Instant::now());
-                ("open", Some(remaining.as_millis() as u64))
+                (BreakerStatus::Open, Some(remaining.as_millis() as u64))
             }
         };
+        let last_error = self
+            .last_error
+            .lock()
+            .expect("last error mutex poisoned")
+            .as_ref()
+            .map(|error| ProviderErrorSnapshot {
+                kind: error.kind,
+                age_ms: error.at.elapsed().as_millis() as u64,
+            });
+
+        ProviderSnapshot {
+            id: self.config.id.clone(),
+            name: self.display_name().to_string(),
+            base_url: self.config.base_url.clone(),
+            wire_api: self.config.wire_api,
+            max_concurrency: self.config.max_concurrency,
+            max_queue: self.config.max_queue,
+            queue_timeout_ms: self.config.queue_timeout_ms,
+            inflight: self.inflight(),
+            queue_depth: self.queue_depth(),
+            breaker: status,
+            cooldown_ms_remaining,
+            consecutive_failures: breaker.failures,
+            attempts: self.attempts.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            last_error,
+        }
+    }
+
+    pub fn status(&self) -> Value {
+        let snapshot = self.snapshot();
         json!({
-            "id": self.config.id,
-            "name": self.display_name(),
-            "base_url": self.config.base_url,
-            "wire_api": self.config.wire_api.to_string(),
-            "max_concurrency": self.config.max_concurrency,
-            "max_queue": self.config.max_queue,
-            "queue_timeout_ms": self.config.queue_timeout_ms,
-            "inflight": self.inflight(),
-            "queue_depth": self.queue_depth(),
-            "breaker": state,
-            "cooldown_ms_remaining": cooldown_until,
-            "consecutive_failures": breaker.failures,
+            "id": snapshot.id,
+            "name": snapshot.name,
+            "base_url": snapshot.base_url,
+            "wire_api": snapshot.wire_api.to_string(),
+            "max_concurrency": snapshot.max_concurrency,
+            "max_queue": snapshot.max_queue,
+            "queue_timeout_ms": snapshot.queue_timeout_ms,
+            "inflight": snapshot.inflight,
+            "queue_depth": snapshot.queue_depth,
+            "breaker": match snapshot.breaker {
+                BreakerStatus::Closed => "closed",
+                BreakerStatus::HalfOpen => "half_open",
+                BreakerStatus::Open => "open",
+            },
+            "cooldown_ms_remaining": snapshot.cooldown_ms_remaining,
+            "consecutive_failures": snapshot.consecutive_failures,
+            "attempts": snapshot.attempts,
+            "successes": snapshot.successes,
+            "failures": snapshot.failures,
+            "last_error": snapshot.last_error.map(|error| json!({
+                "kind": error.kind,
+                "age_ms": error.age_ms,
+            })),
         })
     }
 }

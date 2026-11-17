@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
 
+use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -8,11 +11,34 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
 use crate::error::GatewayError;
 use crate::gateway;
 use crate::state::AppState;
+
+/// Bind the configured address and return the listener plus the actual address.
+pub async fn bind(listen: &str) -> Result<(TcpListener, SocketAddr)> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind {listen}"))?;
+    let actual = listener
+        .local_addr()
+        .with_context(|| "failed to read local address")?;
+    Ok((listener, actual))
+}
+
+/// Serve an Axum application until the shutdown future resolves.
+pub async fn serve<F>(listener: TcpListener, app: Router, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .context("HTTP server failed")
+}
 
 pub fn build_app(state: AppState) -> Router {
     let protected = Router::new()
@@ -39,6 +65,7 @@ async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, GatewayError> {
+    state.metrics.record_request();
     if body.is_empty() {
         return Err(GatewayError::bad_request("request body is empty"));
     }
@@ -113,6 +140,7 @@ async fn healthz(State(state): State<AppState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "providers": state.providers.all().len(),
         "uptime_seconds": state.uptime_seconds(),
+        "requests_total": state.metrics.requests_total(),
     }))
 }
 
@@ -179,6 +207,7 @@ async fn admin_status(State(state): State<AppState>) -> Json<Value> {
         "service": "tomato-router",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": state.uptime_seconds(),
+        "requests_total": state.metrics.requests_total(),
         "listen": state.config.server.listen,
         "require_auth": state.config.server.require_auth,
         "providers": providers,

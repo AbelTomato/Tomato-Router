@@ -53,6 +53,67 @@ Codex (Windows/WSL)
 | `protocol::chat` | Responses 请求 -> Chat 请求、历史消息、工具和工具调用翻译 |
 | `upstream::responses` | 原生 Responses 透传、首事件探测、JSON/SSE 适配 |
 | `upstream::chat` | Chat 上游调用、首事件探测、Chat SSE -> Responses SSE 翻译 |
+| `codex` | Codex `config.toml` 路径解析、provider 字段局部更新、备份和原子替换 |
+| `fsutil` | 同目录原子写入、时间戳备份路径 |
+| `metrics` | 进程级请求计数，供状态接口和 TUI 使用 |
+| `tui` | 终端生命周期、配置草稿、表单编辑、日志缓冲、进程内 supervisor |
+
+## Codex 配置同步
+
+`tomato-router codex sync` 在读取并校验网关配置后生成 Codex 配置更新。默认模型取第一个非 `*` 路由模型，其次取第一个 provider 模型映射，仍没有时使用 `gpt-5.5`；endpoint 默认由 `server.listen` 生成，绑定 `0.0.0.0` 或 `::` 时写入客户端可访问的 `127.0.0.1`。
+
+同步使用 `toml_edit` 修改顶层 `model`、`model_provider` 和 `[model_providers.<id>]` 下的 `name`、`base_url`、`env_key`、`wire_api`，因此无关字段、注释和其他 provider 会保留。已有文件先备份，再把内容写入同目录临时文件并替换目标；空文件或不存在的文件直接创建。`--dry-run` 只生成计划，不创建目录、备份或写入文件。
+
+默认路径遵循 Codex 运行环境：显式 `--codex-config`，其次 `--codex-home`，其次 `CODEX_HOME`，最后是用户 home 下的 `.codex/config.toml`。WSL 配置可通过 Windows 的 WSL UNC 路径显式指定。同步写入的是 `env_key = "TOMATO_ROUTER_KEY"`，密钥值仍由 Codex 运行环境中的环境变量提供。
+
+## TUI 控制台
+
+`tomato-router tui` 在同一个进程内提供配置编辑和网关控制，入口在 `src/tui/mod.rs`。CLI 识别 `tui` 子命令后不会初始化 headless 日志，也不会预先执行 `Config::load` 的运行时校验；因此缺少环境变量的配置仍能打开并修复。
+
+### 进程模型
+
+```text
+main (Tokio runtime)
+  |
+  +-- TUI event loop (async, 200ms redraw tick)
+  |     |
+  |     +-- App (draft config, selections, modals, log buffer)
+  |     +-- input thread (crossterm blocking read -> mpsc)
+  |
+  +-- supervisor task (mpsc commands -> AppState + axum::serve)
+```
+
+UI 不通过 HTTP 读取状态：`ServiceEvent::Running` 携带 `AppState` 克隆，TUI 直接读取 provider 快照和计数器。这样即使本地鉴权开启也不需要额外凭据，同时避免 TUI 请求干扰网关指标。
+
+### 终端生命周期
+
+进入 TUI 时启用 raw mode、alternate screen 和 bracketed paste；`TerminalSession` 的 `Drop` 负责关闭 bracketed paste 并恢复终端，`ratatui::try_init` 同时安装 panic hook。输入线程只把 `Key`、`Paste`、`Resize` 事件送入 channel；主循环按 200ms tick 重绘。退出时接收端先关闭，输入线程在 100ms 轮询间隙检测到 channel 关闭后结束，避免 `join` 卡死。窗口小于 60x18 时只显示尺寸提示，不渲染业务界面。
+
+### 服务生命周期
+
+| 命令 | 行为 |
+| --- | --- |
+| `Start` | 重新读取已保存配置，应用 `--listen` 覆盖，构造 `AppState`，绑定端口并启动 `axum::serve` |
+| `Stop` | 发送 shutdown oneshot，停止接受新连接；最多等待 5 秒，超时后 abort 服务任务 |
+| `Restart` | 先执行 `Stop`，再执行 `Start` |
+| `Shutdown` | 退出前执行 `Stop`，supervisor 结束 |
+
+启动和重启总是读取磁盘文件，而不是内存中的草稿；草稿有未保存修改时，UI 先提示保存。服务意外退出会通过 `ServiceEvent::Failed` 上报，不会静默消失。停止时 TUI 显示活跃请求数；超过 5 秒会提示请求被中断。
+
+### 配置草稿与保存
+
+`Config::parse` 只做 TOML 反序列化，`Config::validate_structure` 校验结构和引用，`Config::validate_runtime` 才解析环境变量和本地鉴权 key。TUI 使用 `Draft { config, saved_config }`：
+
+- `config != saved_config` 表示有未保存修改。
+- 保存前只要求结构校验通过；缺少环境变量会显示警告并阻止启动，但不阻止保存。
+- 保存执行完整 TOML 序列化，先复制旧文件为 `<path>.bak-tomato-<unix-seconds>`，再通过同目录临时文件原子替换。
+- 完整重写不会保留原文件注释和未知字段；需要保留时直接编辑文件。TUI 当前可编辑 provider 的基础字段、鉴权方式、并发/队列/熔断参数和模型映射，`headers`、`query`、`compat`、`retry_after_wait_ms` 仍需手工编辑。
+
+### 日志与指标
+
+TUI 使用自定义 tracing layer 把事件写入内存环形缓冲（默认 4000 行），不写 stdout，避免破坏 alternate screen。默认过滤器为 `tomato_router=info,tower_http=warn`，可通过 `--log` 或 `RUST_LOG` 覆盖；Logs 页再按级别过滤。缓冲不持久化。
+
+`Metrics` 记录进程级 `requests_total`；每个 provider 记录 `attempts`、`successes`、`failures`、最近错误类型和熔断状态。这些字段同时出现在 `/admin/status` 和 TUI 的 Provider 页。
 
 ## 请求生命周期
 

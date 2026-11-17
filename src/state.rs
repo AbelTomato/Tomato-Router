@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::provider::ProviderRegistry;
 use crate::router::ModelRouter;
 
@@ -13,6 +14,7 @@ pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
     pub router: Arc<ModelRouter>,
     pub api_keys: Arc<Vec<String>>,
+    pub metrics: Arc<Metrics>,
     pub started_at: SystemTime,
 }
 
@@ -26,6 +28,7 @@ impl AppState {
             providers,
             router,
             api_keys,
+            metrics: Arc::new(Metrics::default()),
             started_at: SystemTime::now(),
         })
     }
