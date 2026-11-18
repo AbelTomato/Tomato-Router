@@ -1,6 +1,6 @@
 /target
 /config/tomato.toml
-/config/*.bak-tomato-*
+/config/*.bak-*
 /config/.*.tomato-tmp-*
 *.log
 .env
