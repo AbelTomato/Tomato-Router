@@ -15,8 +15,9 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::error::{AttemptError, ErrorKind, classify_http_status, parse_retry_after};
-use crate::protocol::chat::{ToolKind, ToolRoute, ToolRoutes, build_chat_request};
+use crate::protocol::chat::build_chat_request;
 use crate::protocol::sse::{SseEvent, SseParser};
+use crate::protocol::tools::{ToolKind, ToolRoute, ToolRoutes};
 use crate::provider::{Provider, ProviderLease};
 
 pub struct ChatSession {

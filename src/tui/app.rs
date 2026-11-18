@@ -1555,7 +1555,7 @@ impl FormState {
             FormField::choice(
                 "wire_api",
                 "wire_api",
-                &["chat", "responses"],
+                &["chat", "responses", "messages"],
                 &provider.wire_api.to_string(),
             ),
             FormField::text_with_hint(
@@ -1896,6 +1896,7 @@ impl FormState {
         provider.wire_api = match self.choice("wire_api")? {
             "chat" => WireApi::Chat,
             "responses" => WireApi::Responses,
+            "messages" => WireApi::Messages,
             other => return Err(format!("unknown wire_api `{other}`")),
         };
         provider.api_key_env = optional(self.text("api_key_env")?);

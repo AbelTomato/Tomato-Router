@@ -1,9 +1,10 @@
 //! Tomato Router: a local, strict-priority OpenAI Responses gateway.
 //!
 //! The public surface is the Responses API. Requests can be served either by
-//! providers that natively speak Responses (`wire_api = "responses"`) or by
+//! providers that natively speak Responses (`wire_api = "responses"`), by
 //! Chat Completions providers through the translation adapter
-//! (`wire_api = "chat"`).
+//! (`wire_api = "chat"`), or by Anthropic Messages providers through the native
+//! Claude adapter (`wire_api = "messages"`).
 
 pub mod codex;
 pub mod config;

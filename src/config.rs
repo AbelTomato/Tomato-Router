@@ -138,6 +138,7 @@ pub enum WireApi {
     #[default]
     Chat,
     Responses,
+    Messages,
 }
 
 impl fmt::Display for WireApi {
@@ -145,6 +146,7 @@ impl fmt::Display for WireApi {
         match self {
             Self::Chat => f.write_str("chat"),
             Self::Responses => f.write_str("responses"),
+            Self::Messages => f.write_str("messages"),
         }
     }
 }
@@ -185,9 +187,15 @@ pub struct CompatConfig {
     /// Optional provider-specific reasoning delta field, e.g. `reasoning_content`.
     #[serde(default)]
     pub reasoning_field: Option<String>,
-    /// Extra top-level JSON merged into upstream Chat requests.
+    /// Extra top-level JSON merged into upstream Chat or Messages requests.
     #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
+    /// Anthropic thinking strategy for `wire_api = "messages"`.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
+    /// Fallback `max_tokens` when a Messages request omits `max_output_tokens`.
+    #[serde(default = "default_messages_max_tokens")]
+    pub default_max_tokens: u64,
 }
 
 impl Default for CompatConfig {
@@ -199,8 +207,22 @@ impl Default for CompatConfig {
             supports_parallel_tool_calls: true,
             reasoning_field: None,
             extra_body: None,
+            thinking: ThinkingMode::Auto,
+            default_max_tokens: default_messages_max_tokens(),
         }
     }
+}
+
+/// How the native Messages adapter turns Responses reasoning into Anthropic
+/// thinking. `auto` enables adaptive thinking unless the client asks for no
+/// reasoning; `off` never sends a thinking block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    #[default]
+    Auto,
+    Adaptive,
+    Off,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -278,6 +300,12 @@ impl Config {
             {
                 bail!(
                     "provider `{}`: compat.extra_body must be a JSON object",
+                    provider.id
+                );
+            }
+            if provider.compat.default_max_tokens == 0 {
+                bail!(
+                    "provider `{}`: compat.default_max_tokens must be > 0",
                     provider.id
                 );
             }
@@ -507,6 +535,9 @@ fn default_retry_after_wait_ms() -> u64 {
 }
 fn default_max_tokens_field() -> String {
     "max_tokens".to_string()
+}
+fn default_messages_max_tokens() -> u64 {
+    16_384
 }
 fn default_true() -> bool {
     true

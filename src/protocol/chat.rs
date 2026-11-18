@@ -1,61 +1,10 @@
-use std::collections::HashMap;
-
 use serde_json::{Map, Value, json};
 
 use crate::config::ProviderConfig;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolKind {
-    Function,
-    Custom,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolRoute {
-    pub chat_name: String,
-    pub original_name: String,
-    pub namespace: Option<String>,
-    pub kind: ToolKind,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ToolRoutes {
-    by_chat_name: HashMap<String, ToolRoute>,
-    by_original: HashMap<String, String>,
-}
-
-impl ToolRoutes {
-    pub fn resolve(&self, chat_name: &str) -> Option<&ToolRoute> {
-        self.by_chat_name.get(chat_name)
-    }
-
-    pub fn chat_name_for(&self, original_name: &str, namespace: Option<&str>) -> Option<&str> {
-        self.by_original
-            .get(&original_key(namespace, original_name))
-            .map(String::as_str)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_chat_name.is_empty()
-    }
-
-    fn insert(&mut self, route: ToolRoute) {
-        let mut chat_name = route.chat_name.clone();
-        let base = chat_name.clone();
-        let mut suffix = 2;
-        while self.by_chat_name.contains_key(&chat_name) {
-            chat_name = format!("{base}__{suffix}");
-            suffix += 1;
-        }
-        let mut route = route;
-        route.chat_name = chat_name.clone();
-        self.by_original.insert(
-            original_key(route.namespace.as_deref(), &route.original_name),
-            chat_name.clone(),
-        );
-        self.by_chat_name.insert(chat_name, route);
-    }
-}
+use crate::protocol::tools::{
+    ToolRoutes, UpstreamTool, collect_additional_tools, collect_tools, output_to_string,
+    resolve_upstream_name,
+};
 
 #[derive(Debug, Clone)]
 pub struct ChatBuild {
@@ -89,8 +38,9 @@ pub fn build_chat_request(request: &Value, provider: &ProviderConfig) -> Result<
     }
 
     let mut tool_routes = ToolRoutes::default();
-    let mut chat_tools = Vec::new();
-    collect_tools(&tools, None, &mut tool_routes, &mut chat_tools);
+    let mut normalized_tools = Vec::new();
+    collect_tools(&tools, None, &mut tool_routes, &mut normalized_tools);
+    let chat_tools: Vec<Value> = normalized_tools.iter().map(chat_tool).collect();
 
     let mut messages = Vec::new();
     if let Some(instructions) = object.get("instructions").and_then(Value::as_str)
@@ -184,115 +134,20 @@ pub fn build_chat_request(request: &Value, provider: &ProviderConfig) -> Result<
     })
 }
 
-fn collect_additional_tools(input: Option<&Value>, out: &mut Vec<Value>) {
-    let Some(Value::Array(items)) = input else {
-        return;
-    };
-    for item in items {
-        if item.get("type").and_then(Value::as_str) == Some("additional_tools")
-            && let Some(tools) = item.get("tools").and_then(Value::as_array)
-        {
-            out.extend(tools.iter().cloned());
-        }
+fn chat_tool(tool: &UpstreamTool) -> Value {
+    let mut function = Map::new();
+    function.insert("name".to_string(), Value::String(tool.name.clone()));
+    if let Some(description) = &tool.description {
+        function.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
     }
-}
-
-fn collect_tools(
-    tools: &[Value],
-    namespace: Option<&str>,
-    routes: &mut ToolRoutes,
-    out: &mut Vec<Value>,
-) {
-    for tool in tools {
-        match tool.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                    let chat_name = sanitized_chat_name(namespace, name);
-                    let mut function = Map::new();
-                    function.insert("name".to_string(), Value::String(chat_name.clone()));
-                    if let Some(description) = tool.get("description").and_then(Value::as_str) {
-                        function.insert(
-                            "description".to_string(),
-                            Value::String(description.to_string()),
-                        );
-                    }
-                    function.insert(
-                        "parameters".to_string(),
-                        tool.get("parameters")
-                            .cloned()
-                            .unwrap_or_else(|| json!({"type":"object","properties":{}})),
-                    );
-                    if let Some(strict) = tool.get("strict").cloned() {
-                        function.insert("strict".to_string(), strict);
-                    }
-                    out.push(json!({"type": "function", "function": function}));
-                    routes.insert(ToolRoute {
-                        chat_name,
-                        original_name: name.to_string(),
-                        namespace: namespace.map(str::to_string),
-                        kind: ToolKind::Function,
-                    });
-                }
-            }
-            Some("custom") => {
-                if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                    let chat_name = sanitized_chat_name(namespace, name);
-                    let mut description = tool
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    description.push_str(
-                        "\n\nThis is a freeform tool. Put the complete raw input text in the `input` string field. Do not wrap it in markdown fences unless the raw input itself requires them.",
-                    );
-                    if let Some(format) = tool.get("format")
-                        && let Some(definition) = format.get("definition").and_then(Value::as_str)
-                    {
-                        let preview: String = definition.chars().take(2_000).collect();
-                        description.push_str("\n\nInput format constraint:\n");
-                        description.push_str(&preview);
-                    }
-                    out.push(json!({
-                        "type": "function",
-                        "function": {
-                            "name": chat_name,
-                            "description": description,
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "input": {
-                                        "type": "string",
-                                        "description": "Complete raw tool input."
-                                    }
-                                },
-                                "required": ["input"],
-                                "additionalProperties": false
-                            }
-                        }
-                    }));
-                    routes.insert(ToolRoute {
-                        chat_name,
-                        original_name: name.to_string(),
-                        namespace: namespace.map(str::to_string),
-                        kind: ToolKind::Custom,
-                    });
-                }
-            }
-            Some("namespace") => {
-                let nested_namespace = tool
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or(namespace)
-                    .map(str::to_string);
-                if let Some(nested) = tool.get("tools").and_then(Value::as_array) {
-                    collect_tools(nested, nested_namespace.as_deref(), routes, out);
-                }
-            }
-            // Native Responses tools have no Chat Completions equivalent. Dropping them
-            // is preferable to sending an invalid tool schema to a relay.
-            _ => {}
-        }
+    function.insert("parameters".to_string(), tool.input_schema.clone());
+    if let Some(strict) = tool.strict.clone() {
+        function.insert("strict".to_string(), strict);
     }
+    json!({"type": "function", "function": function})
 }
 
 fn translate_input_item(item: &Value, routes: &ToolRoutes, messages: &mut Vec<Value>) {
@@ -318,15 +173,12 @@ fn translate_input_item(item: &Value, routes: &ToolRoutes, messages: &mut Vec<Va
                 .unwrap_or("call_unknown");
             let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
             let namespace = item.get("namespace").and_then(Value::as_str);
-            let chat_name = routes
-                .chat_name_for(name, namespace)
-                .map(str::to_string)
-                .unwrap_or_else(|| sanitized_chat_name(namespace, name));
+            let upstream_name = resolve_upstream_name(routes, name, namespace);
             let arguments = item
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            push_tool_call(messages, call_id, &chat_name, arguments);
+            push_tool_call(messages, call_id, &upstream_name, arguments);
         }
         "custom_tool_call" => {
             let call_id = item
@@ -336,13 +188,10 @@ fn translate_input_item(item: &Value, routes: &ToolRoutes, messages: &mut Vec<Va
                 .unwrap_or("call_unknown");
             let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
             let namespace = item.get("namespace").and_then(Value::as_str);
-            let chat_name = routes
-                .chat_name_for(name, namespace)
-                .map(str::to_string)
-                .unwrap_or_else(|| sanitized_chat_name(namespace, name));
+            let upstream_name = resolve_upstream_name(routes, name, namespace);
             let input = item.get("input").and_then(Value::as_str).unwrap_or("");
             let arguments = json!({ "input": input }).to_string();
-            push_tool_call(messages, call_id, &chat_name, &arguments);
+            push_tool_call(messages, call_id, &upstream_name, &arguments);
         }
         "function_call_output" | "custom_tool_call_output" => {
             let call_id = item
@@ -515,24 +364,6 @@ fn convert_content(content: Option<&Value>, role: &str) -> Option<Value> {
     }
 }
 
-fn output_to_string(output: Option<&Value>) -> String {
-    match output {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| {
-                part.get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| part.get("content").and_then(Value::as_str))
-                    .map(str::to_string)
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    }
-}
-
 fn map_tool_choice(value: Option<&Value>, routes: &ToolRoutes) -> Option<Value> {
     let value = value?;
     match value {
@@ -540,59 +371,14 @@ fn map_tool_choice(value: Option<&Value>, routes: &ToolRoutes) -> Option<Value> 
         Value::Object(object) => {
             let name = object.get("name").and_then(Value::as_str)?;
             let namespace = object.get("namespace").and_then(Value::as_str);
-            let chat_name = routes
-                .chat_name_for(name, namespace)
-                .map(str::to_string)
-                .unwrap_or_else(|| sanitized_chat_name(namespace, name));
+            let upstream_name = resolve_upstream_name(routes, name, namespace);
             Some(json!({
                 "type": "function",
-                "function": { "name": chat_name }
+                "function": { "name": upstream_name }
             }))
         }
         _ => None,
     }
-}
-
-fn original_key(namespace: Option<&str>, name: &str) -> String {
-    format!("{}\u{0}{name}", namespace.unwrap_or(""))
-}
-
-fn sanitized_chat_name(namespace: Option<&str>, name: &str) -> String {
-    let combined = match namespace {
-        Some(namespace) if !namespace.is_empty() => format!("{namespace}__{name}"),
-        _ => name.to_string(),
-    };
-    sanitize_tool_name(&combined)
-}
-
-fn sanitize_tool_name(name: &str) -> String {
-    let mut output = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            output.push(ch);
-        } else {
-            output.push('_');
-        }
-    }
-    if output.is_empty() {
-        output.push_str("tool");
-    }
-    if output.len() > 64 {
-        let hash = fnv1a(name);
-        output.truncate(55);
-        output.push('_');
-        output.push_str(&format!("{hash:08x}"));
-    }
-    output
-}
-
-fn fnv1a(value: &str) -> u32 {
-    let mut hash = 0x811c9dc5u32;
-    for byte in value.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    hash
 }
 
 #[cfg(test)]

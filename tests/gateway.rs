@@ -10,12 +10,183 @@ use serde_json::{Value, json};
 use tomato_router::{AppState, Config, build_app};
 
 #[derive(Default)]
+struct MessagesCaptured {
+    bodies: Vec<Value>,
+    api_keys: Vec<Option<String>>,
+    versions: Vec<Option<String>>,
+}
+
+type MessagesCapture = Arc<Mutex<MessagesCaptured>>;
+
+#[derive(Default)]
 struct Captured {
     bodies: Vec<Value>,
     session_ids: Vec<Option<String>>,
 }
 
 type Capture = Arc<Mutex<Captured>>;
+
+const MESSAGES_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"mock-messages\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":100}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"inspect first\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-integration\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"checking\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_1\",\"name\":\"exec_command\",\"input\":{}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":20}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+async fn messages_mock(
+    State(capture): State<MessagesCapture>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let mut captured = capture.lock().unwrap();
+    captured.bodies.push(body);
+    captured.api_keys.push(
+        headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
+    captured.versions.push(
+        headers
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
+    drop(captured);
+    ([(header::CONTENT_TYPE, "text/event-stream")], MESSAGES_SSE).into_response()
+}
+
+#[tokio::test]
+async fn messages_adapter_streams_thinking_and_tool_calls() {
+    let capture: MessagesCapture = Arc::default();
+    let mock = spawn(
+        Router::new()
+            .route("/v1/messages", post(messages_mock))
+            .with_state(capture.clone()),
+    )
+    .await;
+
+    let config = parse_config(
+        &format!(
+            r#"
+            [[providers]]
+            id = "claude"
+            base_url = "{mock}"
+            wire_api = "messages"
+            api_key = "sk-test"
+            max_concurrency = 4
+
+            [providers.auth]
+            type = "header"
+            header = "x-api-key"
+            prefix = ""
+
+            [providers.models]
+            "tomato-codex" = "mock-messages"
+            "#
+        ),
+        "",
+    );
+    let gateway = spawn_gateway(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/responses"))
+        .json(&json!({
+            "model": "tomato-codex",
+            "stream": true,
+            "instructions": "be brief",
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 2048,
+            "tools": [
+                {"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+                {"type":"custom","name":"apply_patch","description":"Apply a patch"}
+            ],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type":"input_text","text":"list files"}]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-tomato-provider"], "claude");
+    assert_eq!(
+        response.headers()["x-tomato-upstream-model"],
+        "mock-messages"
+    );
+
+    let body = response.text().await.unwrap();
+    assert!(body.contains("response.created"), "{body}");
+    assert!(
+        body.contains("response.reasoning_summary_text.delta"),
+        "{body}"
+    );
+    assert!(body.contains("response.completed"), "{body}");
+
+    let completed = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| event["type"] == "response.completed")
+        .expect("response.completed event");
+    let output = completed["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0]["type"], "reasoning");
+    assert!(output[0]["encrypted_content"].as_str().unwrap().len() > 20);
+    assert_eq!(output[0]["summary"][0]["text"], "inspect first");
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[2]["type"], "function_call");
+    assert_eq!(output[2]["name"], "exec_command");
+    assert_eq!(output[2]["call_id"], "tooluse_1");
+    assert_eq!(output[2]["arguments"], "{\"cmd\":\"ls\"}");
+    assert_eq!(completed["response"]["usage"]["input_tokens"], 110);
+    assert_eq!(
+        completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+        100
+    );
+
+    let captured = capture.lock().unwrap();
+    assert_eq!(captured.api_keys[0].as_deref(), Some("sk-test"));
+    assert_eq!(captured.versions[0].as_deref(), Some("2023-06-01"));
+    let sent = &captured.bodies[0];
+    assert_eq!(sent["model"], "mock-messages");
+    assert_eq!(sent["system"], "be brief");
+    assert_eq!(sent["max_tokens"], 2048);
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["thinking"], json!({"type":"adaptive"}));
+    assert_eq!(sent["output_config"], json!({"effort":"high"}));
+    assert_eq!(sent["messages"][0]["role"], "user");
+    assert_eq!(sent["tools"][0]["input_schema"]["type"], "object");
+    assert_eq!(sent["tools"][1]["input_schema"]["required"][0], "input");
+}
 
 async fn spawn(app: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

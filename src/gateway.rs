@@ -8,7 +8,7 @@ use crate::config::WireApi;
 use crate::error::{AttemptError, ErrorKind, GatewayError};
 use crate::provider::{ProviderLease, QueueError};
 use crate::state::AppState;
-use crate::upstream::{chat, responses};
+use crate::upstream::{chat, messages, responses};
 
 /// Executes one Responses request against the strict-priority provider chain.
 ///
@@ -44,7 +44,7 @@ pub async fn execute(
     };
 
     let mut attempts = Vec::new();
-    let mut chat_json_skips = 0usize;
+    let mut adapter_json_skips = 0usize;
 
     for provider in chain {
         let provider_id = provider.config.id.clone();
@@ -133,7 +133,7 @@ pub async fn execute(
                     // The Chat adapter currently only emits streaming Responses
                     // events. A later provider with a native Responses API can
                     // still serve this request.
-                    chat_json_skips += 1;
+                    adapter_json_skips += 1;
                     attempts.push(AttemptError::new(
                         provider_id,
                         ErrorKind::Client,
@@ -176,10 +176,55 @@ pub async fn execute(
                     }
                 }
             }
+            WireApi::Messages => {
+                if !client_wants_stream {
+                    adapter_json_skips += 1;
+                    attempts.push(AttemptError::new(
+                        provider_id,
+                        ErrorKind::Client,
+                        "the Messages adapter currently requires `stream: true`; use a provider with \
+                         `wire_api = \"responses\"` for non-streaming requests",
+                    ));
+                    continue;
+                }
+
+                let started = messages::start(
+                    provider.clone(),
+                    lease,
+                    &request,
+                    requested_model,
+                    first_byte_timeout,
+                    idle_timeout,
+                )
+                .await;
+
+                match started {
+                    Ok(session) => {
+                        tracing::info!(
+                            provider = %provider_id,
+                            model = requested_model,
+                            "request committed to Messages adapter"
+                        );
+                        return Ok(session.into_response());
+                    }
+                    Err(error) => {
+                        if !error.kind.should_failover() {
+                            return Err(GatewayError::from_attempt(error));
+                        }
+                        tracing::warn!(
+                            provider = %provider_id,
+                            kind = error.kind.as_str(),
+                            message = %error.message,
+                            "Messages provider failed before commit; trying next provider"
+                        );
+                        attempts.push(error);
+                    }
+                }
+            }
         }
     }
 
-    if chat_json_skips > 0 && chat_json_skips == attempts.len() {
+    if adapter_json_skips > 0 && adapter_json_skips == attempts.len() {
         return Err(GatewayError::bad_request(
             "non-streaming requests require a provider with `wire_api = \"responses\"`",
         ));
