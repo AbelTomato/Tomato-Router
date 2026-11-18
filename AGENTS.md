@@ -19,6 +19,10 @@
 | --- | --- |
 | `README.md` | 用户向文档：快速开始、配置说明、Codex/WSL 接入、已知限制 |
 | `docs/architecture.md` | 内部架构：请求生命周期、严格优先级、失败转移、协议翻译 |
+| `docs/configuration.md` | 完整配置参考：provider、鉴权、上游兼容项 |
+| `docs/codex-setup.md` | Codex 接入、自动同步和 WSL 网络访问 |
+| `docs/codex-desktop-custom-models.md` | Codex 桌面端自定义模型目录 |
+| `docs/tui.md` | TUI 按键、保存语义和日志行为 |
 | `docs/devlog/YYYY-MM-DD.md` | 按日期归档的开发日志 |
 | `AGENTS.md` | 本规范与长期维护约定 |
 

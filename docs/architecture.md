@@ -7,7 +7,7 @@ Tomato Router 是运行在 Windows 本机的单进程 HTTP 网关。它接受 Co
 设计约束：
 
 - 对外协议固定为 Responses API。
-- 上游可以是原生 Responses，也可以是 Chat Completions。
+- 上游可以是原生 Responses、Chat Completions 或 Anthropic Messages。
 - 路由是严格单调的：只允许从高优先级向低优先级走。
 - 网关无状态：不存储 response，不依赖 `previous_response_id`。
 - 一旦向客户端提交 SSE 事件，就不再尝试其他 provider。
@@ -32,7 +32,8 @@ Codex (Windows/WSL)
         +--> provider.begin_attempt()       breaker check
         +--> provider.acquire()             semaphore + queue
         +--> upstream::responses::start()   native passthrough
-        |    or upstream::chat::start()     Chat adapter
+        |    or upstream::chat::start()      Chat adapter
+        |    or upstream::messages::start()  Messages adapter
         |
         v
   first SSE event peek
@@ -57,6 +58,33 @@ Codex (Windows/WSL)
 | `fsutil` | 同目录原子写入、时间戳备份路径 |
 | `metrics` | 进程级请求计数，供状态接口和 TUI 使用 |
 | `tui` | 终端生命周期、配置草稿、表单编辑、日志缓冲、进程内 supervisor |
+
+## 代码结构
+
+```text
+src/
+  config.rs          TOML 配置、校验、环境变量展开
+  provider.rs        并发槽位、等待队列、熔断器、鉴权、HTTP client
+  router.rs          严格优先级链解析和模型列表
+  gateway.rs         失败转移主循环
+  server.rs          Axum 路由、本地鉴权、状态接口
+  protocol/
+    chat.rs          Responses -> Chat 请求/历史/工具翻译
+    messages.rs      Responses -> Anthropic Messages 请求/thinking 编解码
+    tools.rs         共享工具路由、namespace 展开和 custom tool 包装
+    sse.rs           SSE 解析器
+  upstream/
+    chat.rs          Chat 上游调用和 Chat -> Responses SSE 翻译
+    messages.rs      Messages 上游调用和 Messages -> Responses SSE 翻译
+    responses.rs     Responses 原生透传和 JSON/SSE 适配
+docs/
+  architecture.md    内部流程和状态机
+  configuration.md   完整配置参考
+  codex-setup.md     Codex 接入和 WSL 网络
+  codex-desktop-custom-models.md
+                     桌面端自定义模型目录
+  tui.md             TUI 按键和保存语义
+```
 
 ## Codex 配置同步
 
@@ -162,7 +190,7 @@ upstream start()
 
 ### 4. 提交点
 
-原生 Responses 和 Chat 适配器都采用“响应头 + 第一个 SSE 事件”双阶段探测：
+原生 Responses、Chat 适配器和 Messages 适配器都采用“响应头 + 第一个 SSE 事件”双阶段探测：
 
 - 非 2xx：读取错误体，分类，记录失败，降级。
 - 2xx 且第一个事件是 `error` / `response.failed`：记录失败，降级。
@@ -189,6 +217,15 @@ Chat 适配器：
 - 在 `finish_reason` / `[DONE]` / 流结束时生成 `response.completed`。
 - 组装完整的 `response.output`，供 `response.completed` 使用。
 
+Messages 适配器：
+
+- 读取 Anthropic Messages SSE。
+- 把 `thinking_delta` 和 `signature_delta` 累积成 Responses reasoning item，并在结束时写入 base64url 编码的 `encrypted_content`。
+- 把 `text_delta` 转成 `response.output_text.delta`。
+- 把 `tool_use` 的 `input_json_delta` 转成函数参数事件或自定义工具输入事件。
+- 在 `message_stop` 生成 `response.completed`；`stop_reason = "max_tokens"` 时生成 `response.incomplete`。
+- 把 `message_start` / `message_delta` 中的 usage（含 cache creation/read）折算成 Responses usage。
+
 ### 6. 非流式
 
 原生 Responses 上游：
@@ -197,7 +234,7 @@ Chat 适配器：
 - 2xx JSON 直接返回。
 - 如果上游返回 SSE，网关收集到终态事件后返回最终 response JSON。
 
-Chat 上游：
+Chat 和 Messages 上游：
 
 - 当前直接跳过并尝试下一个 provider；如果没有原生 Responses provider，返回 400。
 - 这是 MVP 限制，Codex 本身始终使用流式请求。
@@ -336,6 +373,99 @@ custom tool arguments
 
 最后生成 `response.completed`（或 `response.incomplete`），并附带完整 `output` 和 `usage`。
 
+## Responses -> Messages 翻译
+
+### 输入历史
+
+| Responses item | Messages |
+| --- | --- |
+| `message` + `role=developer/system` | 合并到顶层 `system` |
+| `message` + `role=user` | `user` 消息 |
+| `message` + `role=assistant` | assistant content blocks |
+| `function_call` | assistant `tool_use` |
+| `custom_tool_call` | assistant `tool_use`，`input = {"input": "..."}` |
+| `function_call_output` / `custom_tool_call_output` | user `tool_result` |
+| `reasoning` | 解码 `encrypted_content`，还原为 `thinking` / `redacted_thinking` |
+| `additional_tools` | 合并到顶层 `tools` |
+
+重组规则：
+
+- `instructions` 与所有 developer/system 文本按出现顺序合并为顶层 `system`，用空行分隔。
+- 连续的 assistant 文本和 `tool_use` 合并进同一条 assistant 消息；thinking 块放在该消息最前面。
+- 连续的 `tool_result` 合并进同一条 user 消息，避免 Anthropic 因消息角色交替规则拒绝请求。
+- 末尾没有 assistant 轮次可挂载的 reasoning item 会被丢弃。
+- `max_output_tokens` 映射为 `max_tokens`；缺失时使用 `compat.default_max_tokens`（默认 16384）。
+- `tool_choice` 映射：`auto → auto`、`required → any`、`none → none`；`parallel_tool_calls = false` 时附加 `disable_parallel_tool_use = true`。
+- `stop` 映射为 `stop_sequences`；`metadata.user_id` 原样传递。
+- `data:` 图片 URL 转成 Messages `base64` source；普通 URL 转成 `url` source。
+- 原生 Responses 工具没有 Messages 等价物，直接丢弃。
+- MVP 不生成 `cache_control`。
+- 请求要求非流式（`stream` 不是 `true`）时直接拒绝，由网关尝试下一个 provider。
+
+### thinking 与 signature 往返
+
+Anthropic 的多轮工具调用要求把上一轮的 `thinking` 块（含 signature）原样带回。Responses 协议没有对应的公开字段，因此适配器把 thinking 块编码进 `reasoning` item 的 `encrypted_content`：
+
+```text
+encrypted_content = base64url(json({"v":1,"blocks":[{"type":"thinking","thinking":"...","signature":"..."}]}))
+```
+
+- Codex 把 `encrypted_content` 视为不透明字符串，下一轮原样回传。
+- 解码时只接受带非空 signature 的 `thinking` 块，以及 `redacted_thinking`；其他来源或旧版本载荷会被忽略。
+- `reasoning.summary` 同时输出 thinking 文本，供 Codex 展示。
+- `compat.thinking = "auto"` 或 `"adaptive"` 时发送 `thinking: {"type":"adaptive"}`；`reasoning.effort = "none"` 或 `compat.thinking = "off"` 时完全不发送 thinking 字段。
+- `output_config.effort` 映射：`minimal/low → low`、`medium → medium`、`high → high`、`xhigh/max/ultra → max`。
+
+### Messages SSE -> Responses SSE
+
+```text
+message_start (usage)
+  -> 记录 input/cache token
+
+content_block_start(thinking)
+  -> response.output_item.added (reasoning)
+  -> response.reasoning_summary_part.added
+
+thinking_delta / signature_delta
+  -> response.reasoning_summary_text.delta（仅 thinking 文本）
+
+content_block_start(text)
+  -> response.output_item.added (message)
+  -> response.content_part.added
+
+text_delta
+  -> response.output_text.delta
+  -> content_block_stop 生成 output_text.done / content_part.done / output_item.done
+
+content_block_start(tool_use)
+  -> response.output_item.added (function_call 或 custom_tool_call)
+
+input_json_delta
+  -> response.function_call_arguments.delta
+  -> content_block_stop 生成 arguments.done / output_item.done
+
+message_delta
+  -> 记录 stop_reason 和 output_tokens
+
+message_stop
+  -> response.completed（stop_reason = max_tokens 时为 response.incomplete）
+```
+
+`x-tomato-provider` 和 `x-tomato-upstream-model` 响应头与 Chat 适配器一致。
+
+### 错误映射
+
+| Anthropic error type | Gateway 分类 |
+| --- | --- |
+| `authentication_error` / `permission_error` | `Auth` |
+| `not_found_error` | `NotFound` |
+| `rate_limit_error` | `RateLimit` |
+| `overloaded_error` / `api_error` | `Server` |
+| `timeout_error` | `Timeout` |
+| `invalid_request_error` / `request_too_large` | 按 HTTP 状态和消息分类 |
+
+分类后的降级和熔断规则与原生 Responses / Chat 完全一致。
+
 ## 原生 Responses 透传
 
 - 复制客户端 JSON，只改 `model` 和 `stream`。
@@ -356,8 +486,9 @@ custom tool arguments
 
 ## 后续可扩展点
 
-- Chat 适配器的非流式聚合。
+- Chat / Messages 适配器的非流式聚合。
 - Chat reasoning 字段（如 `reasoning_content`）到 Responses reasoning 事件的映射。
+- Messages 的 `cache_control` 断点写入和更精细的 cache 策略。
 - 更精细的 `Retry-After` 处理（当前读取但未用于等待）。
 - 原生 Responses 的 `response.failed` 后错误体保留和更细的错误码映射。
 - 可选的 Windows Service 包装（当前是控制台进程）。

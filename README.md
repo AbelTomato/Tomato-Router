@@ -5,10 +5,11 @@
 ## 特性
 
 - 对外只暴露 Responses API（`POST /v1/responses`），满足 Codex 0.167+ 的 `wire_api = "responses"` 要求。
-- 上游支持两种模式：
+- 上游支持三种模式：
   - `wire_api = "responses"`：原生 Responses 透传，保留 reasoning、原生工具和完整流式事件。
   - `wire_api = "chat"`：把 Responses 请求翻译成 Chat Completions，再把 Chat SSE 翻译回 Responses SSE。
-- 支持 Codex lite 模式的 `additional_tools`：命名空间工具会展开为 Chat 函数（如 `functions__exec`），返回时恢复为带 `namespace` 的 `custom_tool_call`。
+  - `wire_api = "messages"`：把 Responses 请求翻译成 Anthropic Messages，支持 Claude thinking/signature 往返，再把 Messages SSE 翻译回 Responses SSE。
+- 支持 Codex lite 模式的 `additional_tools`：命名空间工具会展开为上游工具名（如 `functions__exec`），返回时恢复为带 `namespace` 的调用。
 - 严格优先级：每个新请求都从最高优先级开始；某个 provider 失败、队列满或熔断时才向下走，绝不反向或加权路由。
 - 每 provider 独立并发上限、等待队列、队列超时和熔断器。
 - `max_queue = 0` 表示不等待：并发槽位满时立即降级到下一个 provider。
@@ -80,31 +81,7 @@ curl.exe -H "Authorization: Bearer $env:TOMATO_ROUTER_KEY" http://127.0.0.1:8787
 .\target\release\tomato-router.exe --config config\tomato.toml tui --autostart
 ```
 
-TUI 和网关运行在同一个进程里。退出 TUI（`q` 或 Ctrl+C）会先停止网关，不会留下后台服务；需要常驻服务时继续使用上面的 headless 启动方式。TUI 要求交互式终端，建议使用 Windows Terminal，窗口至少 60x18。
-
-界面包含 Dashboard、Providers、Routes、Settings、Logs、Help 六页，按 `1`-`6` 或 `Tab` 切换。
-
-| 按键 | 作用 |
-| --- | --- |
-| `s` / `x` / `r` | 启动 / 停止 / 重启网关 |
-| `F5` | 必要时先保存，再启动或重启 |
-| `w` | 保存配置 |
-| `v` | 查看校验结果、错误和警告 |
-| `R` | 从磁盘重新加载配置 |
-| `a` / `Enter` / `d` | 新增 / 编辑 / 删除当前页的 provider 或 route |
-| `Ctrl+Up` / `Ctrl+Down` | 调整 provider 声明顺序（即默认优先级） |
-| `q` / `Ctrl+C` | 退出；网关运行时会先确认并停止 |
-| `?` | 打开帮助 |
-
-保存和启动语义：
-
-- 保存会重写完整 TOML，并在同目录生成 `config/tomato.toml.bak-tomato-<时间戳>` 备份。**注释和未知字段不会保留**，需要保留注释或编辑 `headers`、`query`、`compat`、`retry_after_wait_ms` 等高级字段时，请直接编辑配置文件。
-- 启动和重启总是读取磁盘上的已保存配置；存在未保存修改时会先提示保存。
-- 停止时最多等待 5 秒让活跃请求结束，超时后中断剩余请求。
-- API key 在非编辑状态下会掩码显示，但内联 `api_key` 仍以明文写入配置；备份文件也可能包含密钥，注意保护或删除。
-- 环境变量在网关启动时解析；修改环境变量后需要退出并重新启动 TUI，仅在 TUI 内重启网关不会重新读取父进程环境。
-
-日志页只保留进程内的环形缓冲，不会写入日志文件；需要持久日志时使用 headless 模式并重定向输出。
+TUI 要求交互式终端，建议使用 Windows Terminal，窗口至少 60x18。按键、保存语义和日志行为见 [docs/tui.md](docs/tui.md)。
 
 ## 配置 Codex
 
@@ -130,77 +107,17 @@ codex
 
 如果网关关闭了本地鉴权，Codex 仍然可以配置一个占位 `env_key`，网关不会校验它。
 
-### 自动同步 Codex 配置
-
-网关配置完成后，可以让 Tomato Router 自动更新 Codex 的用户级 `config.toml`。命令只维护 `model`、`model_provider` 以及目标 provider 下的 `name`、`base_url`、`env_key` 和 `wire_api`，会保留 Codex 的其他设置、注释和已有 provider 字段；不会把真实 API key 写入文件或输出到日志。
+自动更新 Codex 配置：
 
 ```powershell
 .\target\release\tomato-router.exe --config config\tomato.toml codex sync
 ```
 
-默认目标是 Windows 的 `%USERPROFILE%\.codex\config.toml`，Linux/WSL 中则使用 `$CODEX_HOME/config.toml`，没有 `CODEX_HOME` 时使用 `~/.codex/config.toml`。可以显式指定目标：
+命令支持 `--dry-run`、显式 `--codex-config` / `--codex-home` 和 WSL UNC 路径，细节见 [docs/codex-setup.md](docs/codex-setup.md)。
 
-```powershell
-# Windows 原生 Codex
-.\target\release\tomato-router.exe --config config\tomato.toml codex sync `
-  --codex-config "$env:USERPROFILE\.codex\config.toml" `
-  --model gpt-5.5
+WSL 访问 Windows 上的网关有镜像网络和 NAT 两种方式，见 [docs/codex-setup.md#wsl-访问-windows-上的网关](docs/codex-setup.md#wsl-访问-windows-上的网关)。
 
-# 从 Windows 访问 WSL 中的 Codex 配置
-.\target\release\tomato-router.exe --config config\tomato.toml codex sync `
-  --codex-config "\\wsl.localhost\Ubuntu\home\user\.codex\config.toml"
-```
-
-执行前可用 `--dry-run` 预览目标和将写入的字段。已有文件在修改前会生成同目录的 `config.toml.bak-tomato-<时间戳>` 备份，并使用同目录临时文件替换；重复执行不会重复添加字段。修改后重启 Codex；如果使用 Codex daemon，也需要重启 daemon 使其重新读取配置。
-
-`--codex-config` 优先级高于 `--codex-home`，两者都未提供时才读取 `CODEX_HOME`。Windows 上同步 WSL 配置时建议传入 `\\wsl.localhost\<发行版>\home\<用户>\.codex\config.toml` 这类 UNC 路径；也可以直接在 WSL 中执行命令。
-
-### WSL 访问 Windows 上的网关
-
-有两种方式，任选一种。
-
-**方式 A：WSL 镜像网络（推荐）**
-
-在 Windows 用户目录创建或修改 `%USERPROFILE%\.wslconfig`：
-
-```ini
-[wsl2]
-networkingMode=mirrored
-```
-
-然后重启 WSL：
-
-```powershell
-wsl --shutdown
-```
-
-重启后 WSL 内的 `127.0.0.1` 会映射到 Windows 本机，Codex 直接使用：
-
-```toml
-base_url = "http://127.0.0.1:8787/v1"
-```
-
-**方式 B：NAT 网络**
-
-1. 把网关改成监听所有网卡：
-
-   ```toml
-   [server]
-   listen = "0.0.0.0:8787"
-   require_auth = true
-   api_keys = ["${TOMATO_ROUTER_KEY}"]
-   ```
-
-2. 放行 Windows 防火墙的 TCP 8787 入站。
-3. 在 WSL 中取 Windows 主机 IP：
-
-   ```bash
-   ip route show | awk '/default/ {print $3}'
-   ```
-
-4. Codex 配置使用 `http://<Windows-IP>:8787/v1`，并设置 `TOMATO_ROUTER_KEY`。
-
-> 绑定 `0.0.0.0` 时务必启用 `require_auth`。不要把无鉴权的网关暴露到局域网或公网。
+要让 Claude 等非内置模型出现在 Codex 桌面端选择器，需要配置 `model_catalog_json`；完整步骤见 [docs/codex-desktop-custom-models.md](docs/codex-desktop-custom-models.md)。
 
 ## API
 
@@ -217,9 +134,7 @@ base_url = "http://127.0.0.1:8787/v1"
 
 所有 `/v1/*` 和 `/admin/*` 接口在 `require_auth = true` 时都需要 `Authorization: Bearer <key>`，也接受 `x-api-key: <key>`。
 
-## 优先级与故障转移语义
-
-### 路由链
+## 路由与故障转移
 
 请求模型按以下顺序解析 provider 链：
 
@@ -229,105 +144,46 @@ base_url = "http://127.0.0.1:8787/v1"
 
 链内顺序就是严格优先级。每个新请求都从链首开始，不会因为上一个请求用了低优先级 provider 就继续用它。
 
-### 单次尝试
+网关会先读取上游的响应头和**第一个 SSE 事件**，确认不是错误事件后才向客户端发送 `response.created`。因此连接失败、上游非 2xx、错误首事件和首事件前断开都可以安全降级；一旦第一个正常事件已经发给客户端，后续错误会变成客户端可见的 `response.failed` 或 `error` 事件。
 
-对链中的每个 provider：
+401/403、404、429、5xx、网络错误、连接超时、首字节超时和上游协议错误会触发降级；400 普通请求错误、上下文长度超限和内容策略拒绝会直接返回客户端。
 
-1. 熔断器打开且未到冷却时间：跳过，记录 `provider_unavailable`。
-2. 尝试获取并发槽位：
-   - 有空闲槽位：立即获得。
-   - 没有空闲槽位且 `max_queue = 0`：记录 `queue_full`，立即尝试下一个 provider。
-   - 没有空闲槽位且 `max_queue > 0`：最多等待 `queue_timeout_ms`；超时记录 `queue_timeout`，尝试下一个。
-3. 发出上游请求，等待响应头和第一个 SSE 事件。
-4. 成功：把请求提交给该 provider，后续事件直接流给客户端。
-5. 失败：如果是可重试错误，记录并尝试下一个 provider。
+完整状态机、队列、熔断器和错误分类见 [docs/architecture.md](docs/architecture.md)。
 
-### 哪些错误会降级
+## 配置参考
 
-会降级：
-
-- 401 / 403（上游 key 无效）
-- 404（模型不存在）
-- 429
-- 5xx
-- 网络错误、连接超时、首字节超时
-- 上游协议错误（例如流在第一个事件前结束）
-
-不会降级，直接返回客户端：
-
-- 400 普通请求错误
-- 上下文长度超限
-- 内容策略拒绝
-
-这样做是为了避免把同一个明显无效的请求重复发送给所有 provider，掩盖真正的问题。
-
-### 提交点
-
-网关会先读取上游的响应头和**第一个 SSE 事件**，确认不是错误事件后才向客户端发送 `response.created`。因此以下情况仍可安全降级：
-
-- 连接失败
-- 上游返回非 2xx
-- 上游返回 200 但第一个事件是 `error` / `response.failed`
-- 上游在第一个事件前断开
-
-一旦第一个正常事件已经发给客户端，协议上就没有安全的降级点了。后续错误会变成客户端可见的 `response.failed` 或 `error` 事件。
-
-## Provider 配置参考
+最小 provider 示例：
 
 ```toml
 [[providers]]
-id = "primary"                 # 必填，唯一
-name = "Primary relay"         # 可选，展示名
-base_url = "https://relay/v1"  # 必填，API 根路径（通常以 /v1 结尾）
-wire_api = "responses"         # "responses"（默认 "chat"）
-api_key_env = "PRIMARY_KEY"    # 推荐
-# api_key = "${PRIMARY_KEY}"   # 也支持环境变量展开
-# auth = { type = "none" }
+id = "primary"
+name = "Primary relay"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"         # "responses"、"chat" 或 "messages"
+api_key_env = "PRIMARY_KEY"
 
-max_concurrency = 4            # 同时进行中的流数量
-max_queue = 8                  # 等待队列长度；0 = 不等待
-queue_timeout_ms = 800         # 排队最长时间
-cooldown_ms = 30000            # 熔断基础冷却时间
-failure_threshold = 3          # 连续失败多少次后打开熔断器
-retry_after_wait_ms = 1000     # 预留：上游 Retry-After 的处理策略
+max_concurrency = 4
+max_queue = 8
+queue_timeout_ms = 800
+cooldown_ms = 30000
+failure_threshold = 3
 
 [providers.models]
 "client-model" = "upstream-model"
 ```
 
-鉴权方式：
-
-| 配置 | 行为 |
-| --- | --- |
-| `api_key_env = "NAME"` | 从环境变量读取，默认 `Authorization: Bearer <key>` |
-| `api_key = "sk-..."` 或 `api_key = "${NAME}"` | 直接配置或展开环境变量 |
-| `auth = { type = "none" }` | 不发送鉴权 |
-| `auth = { type = "header", header = "x-api-key", prefix = "" }` | 自定义 header |
-| `auth = { type = "query", query_param = "api_key" }` | 查询参数 |
-
-`base_url` 应指向 API 根路径，例如 `https://relay.example.com/v1`。网关会自动拼接 `responses` 或 `chat/completions`。
-
-### Chat 上游兼容选项
-
-```toml
-[providers.compat]
-max_tokens_field = "max_tokens"          # 或 "max_completion_tokens"
-supports_stream_options = true
-supports_reasoning_effort = false
-supports_parallel_tool_calls = true
-# reasoning_field = "reasoning_content"
-# extra_body = { top_k = 20 }
-```
+鉴权方式、Chat 兼容选项、Messages/Claude 参数和高级字段见 [docs/configuration.md](docs/configuration.md)。
 
 ## 已知限制
 
-- **Chat 适配器只支持流式请求。** Codex 始终发送 `stream: true`，所以正常使用不受影响；`stream: false` 需要原生 Responses 上游。
-- **Chat 适配器会丢弃原生工具。** `web_search`、`tool_search` 等 Responses 原生工具没有 Chat Completions 等价物，会被跳过。函数工具和自定义工具会被翻译。
-- **Chat 适配器会丢弃 reasoning item。** Chat Completions 没有可移植的加密 reasoning 表示；可见消息和工具调用历史仍完整保留。
-- **`apply_patch` 是尽力而为的转换。** 网关把自定义工具包装成只有一个 `input` 字符串的函数，再把 `input` 还原成 `custom_tool_call`。模型如果不遵守格式，可能生成无效 patch。
-- **网关完全无状态。** `previous_response_id` 会被拒绝；Codex 使用 `store: false` 并每次发送完整历史，因此可以安全地跨 provider 重放。
-- **不保证 prompt cache 命中。** 原生 Responses 模式下会转发 `session-id`、`thread-id`、`x-codex-turn-metadata` 等白名单 header，但不同 provider 的缓存策略不同。
-- **Chat 模式的 reasoning 内容目前不会转成 reasoning 事件。** 只输出可见文本和工具调用。
+- **Chat 和 Messages 适配器只支持流式请求。** 非流式请求需要原生 Responses 上游；Codex 始终发送 `stream: true`，正常使用不受影响。
+- **Chat 和 Messages 适配器会丢弃原生工具。** `web_search`、`tool_search` 等没有等价物；函数工具和自定义工具会翻译。
+- **Messages 的 thinking 通过 reasoning summary 暴露。** thinking 文本和 signature 保存在 `encrypted_content` 中，隐藏推理不保证完整可见；MVP 不实现 `cache_control`。
+- **网关完全无状态。** `previous_response_id` 会被拒绝；Codex 使用 `store: false` 并每次发送完整历史。
+- **不保证 prompt cache 命中。** 不同 provider 的缓存策略不同。
+- **`apply_patch` 是尽力而为的转换。** 模型不遵守格式时可能生成无效 patch。
+
+更多协议限制和后续扩展点见 [docs/architecture.md](docs/architecture.md)。
 
 ## 开发
 
@@ -337,23 +193,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-项目结构：
+代码结构、组件职责和请求流程见 [docs/architecture.md](docs/architecture.md)。
 
-```text
-src/
-  config.rs          TOML 配置、校验、环境变量展开
-  provider.rs        并发槽位、等待队列、熔断器、鉴权、HTTP client
-  router.rs          严格优先级链解析和模型列表
-  gateway.rs         失败转移主循环
-  server.rs          Axum 路由、本地鉴权、状态接口
-  protocol/
-    chat.rs          Responses -> Chat 请求/历史/工具翻译
-    sse.rs           SSE 解析器
-  upstream/
-    chat.rs          Chat 上游调用和 Chat -> Responses SSE 翻译
-    responses.rs     Responses 原生透传和 JSON/SSE 适配
-docs/
-  architecture.md    内部流程和状态机
-```
+## 文档
 
-更多实现细节见 [docs/architecture.md](docs/architecture.md)。
+- [docs/architecture.md](docs/architecture.md)：请求生命周期、严格优先级、失败转移、协议翻译
+- [docs/configuration.md](docs/configuration.md)：完整 provider、鉴权和上游兼容项
+- [docs/codex-setup.md](docs/codex-setup.md)：Codex 接入、自动同步和 WSL 网络
+- [docs/codex-desktop-custom-models.md](docs/codex-desktop-custom-models.md)：桌面端自定义模型目录
+- [docs/tui.md](docs/tui.md)：TUI 按键和保存语义
+- [docs/devlog/](docs/devlog/)：开发日志
